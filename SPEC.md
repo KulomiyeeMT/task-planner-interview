@@ -6,7 +6,7 @@
 
 本方案在模型调用前通过数据库条件更新原子预占一个额度；未预占成功的请求直接返回。模型调用或结果保存失败时返还额度，成功时保留扣费并保存结果。服务端是额度判断的唯一可信来源，前端只负责展示状态和操作建议。
 
-当前状态：规格初稿已完成，代码与验证尚未实施。
+当前状态：服务端额度预占与返还、客户端状态反馈、单元测试和 PostgreSQL 并发集成测试入口均已完成。核心测试已运行通过；当前机器不支持 Wasp 且没有 PostgreSQL，框架编译和数据库集成用例尚待在 README 指定的 WSL2 环境复验。
 
 ## 范围与假设
 
@@ -25,7 +25,7 @@
 2. 执行带 `id = userId AND credits > 0` 条件的 `User.updateMany`，同时将 `credits` 原子减一。
 3. 更新数量为 1 时调用模拟模型。
 4. 保存 `PlanResult`。
-5. 返回日程和最新剩余额度；前端展示日程、刷新额度并提示本次已消耗一个额度。
+5. 返回日程；Wasp 根据 `User` Entity 使额度查询缓存失效，前端展示日程、刷新数据库额度并提示本次已消耗一个额度。
 
 ### 额度不足
 
@@ -60,11 +60,11 @@ User.updateMany({
 
 ## 实现拆解
 
-1. 从日程生成操作中抽取可测试的额度预占与返还逻辑。
-2. 调整 `generatePlan`：服务端参数校验、预占、调用模型、保存结果、失败返还，并返回剩余额度。
-3. 调整客户端响应类型和提示，使成功、额度不足、模型失败均给出明确下一步。
-4. 添加无需真实模型的自动化测试，覆盖预占边界和并发竞争；添加 PostgreSQL 集成验证入口，覆盖完整生成流程。
-5. 运行编译、类型检查和测试，把命令与实际结果记录到本文件和 `SUBMISSION.md`。
+1. `creditReservation.ts` 抽取额度预占与“生成—保存—失败返还”编排，区分额度不足、预占异常和返还异常。
+2. `generatePlan` 在服务端校验小时数和非空任务，原子预占后才调用模型；模型或保存失败时返还额度。
+3. `getCurrentCredits` 提供数据库中的实时额度；客户端在 Action 成功后由 Wasp 的 Entity 缓存失效机制刷新查询，并针对成功、额度不足和已返还失败提供中文提示。
+4. `creditReservation.test.ts` 覆盖核心流程和五路并发；`creditReservation.integration.test.ts` 使用真实 Prisma/PostgreSQL 验证五个条件更新只成功一个。
+5. `vitest.quota.config.mjs` 隔离额度测试与 Wasp 的 Vite 配置，使核心测试可以独立运行。
 
 ## 验收案例
 
@@ -100,10 +100,41 @@ User.updateMany({
 
 ## 验证记录
 
-尚未运行。实现完成后在此按 AC 编号记录命令、预期、实际结果和环境限制。
+### 已运行：核心测试
+
+命令：
+
+```sh
+pnpm dlx vitest@4.1.9 --config vitest.quota.config.mjs run
+```
+
+结果：1 个测试文件通过、1 个数据库测试文件因未配置 `DATABASE_URL` 跳过；8 个测试通过、1 个跳过。
+
+| 案例 | 自动化证据 | 实际结果 |
+| --- | --- | --- |
+| AC-1 | `persists a successful result and keeps the charge` | 通过；持久化一次，额度从 3 变为 2。 |
+| AC-2 | `does not call the provider or persist when no credit is available` | 通过；生成和持久化均为 0 次，额度保持 0。 |
+| AC-3 | `refunds the credit when generation fails` | 通过；错误向上返回，额度从预占后的 0 恢复为 1。 |
+| AC-4 | `allows only one provider call when five requests share one credit` | 通过；1 个成功、4 个失败，生成和持久化各 1 次，最终额度为 0。 |
+| AC-5 | 服务端 Zod 范围校验与空任务分支 | 实现已检查；完整 Action 集成验证待标准 Wasp 环境运行。 |
+
+同一测试集还验证了结果保存失败会返还额度、预占查询失败不会调用模型、返还失败会产生独立错误。
+
+### 未运行：框架和数据库检查
+
+当前环境为 Windows、Node.js 20.20.2，没有 WSL2、Docker 或 PostgreSQL。Wasp 0.25.0 安装程序实际返回 `Wasp is not supported on this platform`，因此以下检查未伪造结果：
+
+```sh
+wasp compile
+npx tsc --project tsconfig.src.json --noEmit
+npx tsc --project tsconfig.wasp.json --noEmit
+DATABASE_URL=postgresql://... npm run test:quota:db
+```
+
+数据库用例会创建一个额度为 1 的临时用户，并行执行五次实际 Prisma 条件更新，断言只有一次成功且数据库余额为 0，随后删除临时用户。
 
 ## 待办与交接
 
-- 实现上述服务端、客户端和测试改动。
-- 在 Node.js 24.14.1、Wasp 0.25.0 与 PostgreSQL 环境运行仓库基础检查和数据库并发验证。
-- 填写候选人公开信息及最终验证记录。
+- 在 Node.js 24.14.1、Wasp 0.25.0 与 PostgreSQL 环境运行上述未执行检查；若发现框架生成类型差异，保持当前业务流程不变并调整类型声明。
+- 进程在预占后、返还前崩溃时仍可能遗失一个额度；题目明确不要求自动补偿。生产方案可增加额度流水和超时回收任务。
+- 提交 PR 前填写候选人称呼与打码手机号，并用相同内容设置 PR 标题。
